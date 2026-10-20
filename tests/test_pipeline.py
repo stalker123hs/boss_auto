@@ -1,0 +1,572 @@
+# -*- coding: utf-8 -*-
+"""pipeline.py 的编排测试 —— 一个子进程都不真起。
+
+最重要的一条断言在最后：**流水线跑到终点也绝不执行 apply.py**。其余用例覆盖
+「阶段区间」「失败就停」「快速模式补投递池」「爬空了不许往下走」这几处编排逻辑，
+它们的共同特点是：错了不会报错，只会安静地少投几个岗位或多烧一轮 token。
+
+注意 `--to render`：不给终点时 pipeline **只跑一个阶段**，所以要断言「九个阶段全跑」的用例
+必须显式给 `--to render`。用例 11 专门盯这套区间语义。
+
+做法：换掉 pipeline.run_stage（真正 fork 子进程的地方），记录被调用的阶段与命令。
+阶段之后的产物核查照旧真跑（读真文件），因为那正是要测的东西。
+
+跑法：python tests/test_pipeline.py
+"""
+
+import os
+import io
+import sys
+import json
+import shutil
+import tempfile
+import contextlib
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
+
+for _stream in (sys.stdout, sys.stderr):
+    _stream.reconfigure(encoding='utf-8', errors='replace')
+
+import pipeline
+from resume_matcher import paths
+
+RAN = []            # [(阶段名, argv), ...]
+CODES = {}          # 阶段名 → 让它返回的退出码
+
+
+def _fake_run_stage(name, cmd, run_dir, timed=False):
+    RAN.append((name, cmd))
+    return CODES.get(name, 0)
+
+
+def build_run_dir(scored=None, qualified=None, profile=True, params=None,
+                  crawl_summary=True, materials=()):
+    # 四桶重构后产物不再平铺在 run_dir 根，统一走 paths 助手落进 state/、materials/。
+    # 写测试也照 production 路径取，别自己拼 —— 手拼路径正是这文件曾经红一片的原因。
+    run_dir = tempfile.mkdtemp(prefix='pipeline_')
+
+    def _write(path, data):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        json.dump(data, open(path, 'w', encoding='utf-8'), ensure_ascii=False)
+
+    if profile:
+        _write(paths.profile_path(run_dir), {'basic_info': {'name': '张三'}})
+    if params is not None:
+        _write(paths.crawl_params_path(run_dir), params)
+    if scored is not None:
+        _write(paths.scored_jobs_path(run_dir), scored)
+    if qualified is not None:
+        _write(paths.qualified_jobs_path(run_dir), qualified)
+    if crawl_summary:
+        _write(paths.crawl_summary_path(run_dir),
+               {'written': 40, 'total': 40, 'skipped': 0, 'run_dups': 0})
+    if materials:
+        # 契约：greeting_{i}_{公司}.txt / resume_{i}_{公司}.json，都在 materials/ 桶。
+        for kind, index, tag in materials:
+            if kind == 'greeting':
+                _write(paths.greeting_path(run_dir, index, tag), '内容')
+            else:
+                _write(os.path.join(paths.materials_dir(run_dir),
+                                    'resume_%d_%s.json' % (index, tag)), '内容')
+    return run_dir
+
+
+def run(argv):
+    RAN.clear()
+    return pipeline.main(argv)
+
+
+def run_capture(argv):
+    """跑一遍并把 stdout 收下来 —— 提示文案本身就是要测的东西。"""
+    RAN.clear()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = pipeline.main(argv)
+    return code, buf.getvalue()
+
+
+def stages_ran():
+    # 只数真阶段。llm_check / write_application_md / verify_image 都是自动子步骤，
+    # 不是 STAGES 一员，不该让它们把「阶段顺序」的断言搞出个子项。
+    return [name for name, _ in RAN if name in pipeline.STAGES]
+
+
+def cmd_of(name):
+    for stage, cmd in RAN:
+        if stage == name:
+            return cmd
+    return []
+
+
+# 一个岗位在 scored_jobs.json 里长什么样：原始 CSV 字段 + 评分字段混在一起
+def scored_job(company, position, link, extra=None):
+    job = {
+        'link': link, '职位': position, '公司': company, '城市': '杭州',
+        '薪资': '15-25K', '经验': '1-3年', '学历': '本科',
+        '岗位要求和职责': 'JD 正文', 'HR活跃度': '刚刚活跃',
+        'match_score': 92, 'application_category': 'qualified',
+        'analysis': {'skill_match': 0.9},
+    }
+    job.update(extra or {})
+    return job
+
+
+def main():
+    failures = []
+
+    def check(label, cond, detail=''):
+        print('%s %s%s' % ('  ✅' if cond else '  ❌', label,
+                           '' if cond else '  ← ' + detail))
+        if not cond:
+            failures.append(label)
+
+    pipeline.run_stage = _fake_run_stage
+    # 岗位池行数：真去扫 assets/post_data 会把开发机上的历史数据算进来，
+    # 结果随机器而变。这里固定住，min-jobs 那道闸门才测得准。
+    pipeline.job_pool_rows = lambda: 40
+
+    print('=== 1. --dry-run：九个阶段按序打印，一个都不执行 ===')
+    resume = tempfile.mktemp(suffix='.md')
+    with open(resume, 'w', encoding='utf-8') as f:
+        f.write('# 张三\nPython 后端开发，3 年经验。')
+    run_dir = build_run_dir(params={'keywords': ['Python'], 'cities': ['杭州'],
+                                    'mode': 'custom', 'match_mode': 'deep', 'top_n': 10})
+    try:
+        CODES.clear()
+        code = run([resume, '--run-dir', run_dir, '--to', 'render', '--dry-run'])
+        check('退出码 0', code == 0, '实际 %s' % code)
+        check('一个阶段都没执行', stages_ran() == [], str(stages_ran()))
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+    # --dry-run 不给 --run-dir 时也不能留下痕迹：真跑一次会 create_run_dir()，
+    # 那会把 LATEST.txt 指到新目录 —— 而 LATEST.txt 是 --from 续跑、
+    # run_matcher --merge、where_am_i 共用的「当前运行」指针。dry-run 把它指到
+    # 一个空目录，等于把上一轮真实运行的续跑入口悄悄换掉。
+    latest_file = os.path.join(pipeline.OUTPUT_DIR, 'LATEST.txt')
+    before = (open(latest_file, encoding='utf-8').read()
+              if os.path.exists(latest_file) else None)
+    dirs_before = set(os.listdir(pipeline.OUTPUT_DIR)) \
+        if os.path.isdir(pipeline.OUTPUT_DIR) else set()
+    CODES.clear()
+    code = run([resume, '--to', 'render', '--dry-run'])
+    after = (open(latest_file, encoding='utf-8').read()
+             if os.path.exists(latest_file) else None)
+    dirs_after = set(os.listdir(pipeline.OUTPUT_DIR)) \
+        if os.path.isdir(pipeline.OUTPUT_DIR) else set()
+    check('--dry-run 不新建运行目录', dirs_after == dirs_before,
+          str(sorted(dirs_after - dirs_before)))
+    check('--dry-run 不改写 LATEST.txt 指针', after == before,
+          '%r → %r' % (before, after))
+    check('--dry-run 无 --run-dir 也是退出码 0', code == 0, '实际 %s' % code)
+
+    print('\n=== 2. 深度模式 --to render：九个阶段全跑，顺序不能乱 ===')
+    run_dir = build_run_dir(
+        params={'keywords': ['Python'], 'cities': ['杭州'], 'mode': 'custom',
+                'match_mode': 'deep', 'top_n': 10, 'min_count': 20},
+        qualified=[{'公司': 'XX科技', '职位': 'Java开发', 'link': 'https://x/1'}],
+        materials=[('greeting', 1, 'XX科技'), ('resume', 1, 'XX科技')])
+    try:
+        CODES.clear()
+        code = run([resume, '--run-dir', run_dir, '--to', 'render', '--verify'])
+        check('退出码 0', code == 0, '实际 %s' % code)
+        check('阶段顺序完整',
+              stages_ran() == ['parse', 'infer', 'crawl', 'match', 'deep',
+                               'merge', 'materials', 'verify', 'render'], str(stages_ran()))
+        check('match 走 deep 且带 --top 10',
+              '--mode' in cmd_of('match') and 'deep' in cmd_of('match')
+              and '--top' in cmd_of('match') and '10' in cmd_of('match'),
+              pipeline.show(cmd_of('match')))
+        check('merge 带 --merge', '--merge' in cmd_of('merge'), pipeline.show(cmd_of('merge')))
+        check('crawl 参数由 crawl_params 拼出（-p/-c/-y 齐）',
+              all(f in cmd_of('crawl') for f in ('-p', 'Python', '-c', '杭州', '-y')),
+              pipeline.show(cmd_of('crawl')))
+        check('crawl 带 --run-dir', '--run-dir' in cmd_of('crawl'))
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+    print('\n=== 3. 快速模式：跳过 deep/merge，并补出 qualified_jobs.json ===')
+    run_dir = build_run_dir(
+        params={'keywords': ['Python'], 'cities': ['杭州'], 'match_mode': 'quick'},
+        scored={'tier1': [scored_job('XX科技', 'Java开发', 'https://x/1')],
+                'tier2': [scored_job('YY公司', '全栈工程师', 'https://x/2')],
+                'tier3': [scored_job('ZZ集团', '测试', 'https://x/3')],
+                'tier4': [], 'total': 3},
+        materials=[('greeting', 1, 'XX科技'), ('resume', 1, 'XX科技'),
+                   ('greeting', 2, 'YY公司'), ('resume', 2, 'YY公司')])
+    try:
+        CODES.clear()
+        code = run([resume, '--run-dir', run_dir, '--to', 'render'])
+        check('退出码 0', code == 0, '实际 %s' % code)
+        check('deep/merge 没跑', 'deep' not in stages_ran() and 'merge' not in stages_ran(),
+              str(stages_ran()))
+        check('match 走 quick', 'quick' in cmd_of('match'), pipeline.show(cmd_of('match')))
+
+        path = paths.qualified_jobs_path(run_dir)
+        pool = json.load(open(path, encoding='utf-8')) if os.path.exists(path) else None
+        check('qualified_jobs.json 被补出来了', isinstance(pool, list))
+        if isinstance(pool, list):
+            check('只收 tier1 + tier2（tier3 不投）', len(pool) == 2, '实际 %d' % len(pool))
+            check('顺序是符合在前', (pool[0].get('公司'), pool[1].get('公司'))
+                  == ('XX科技', 'YY公司'), str([j.get('公司') for j in pool]))
+            check('只留原始爬取字段（评分字段不带进去）',
+                  all('match_score' not in j and 'analysis' not in j for j in pool),
+                  str(sorted(pool[0])))
+            check('link 在（下游按 link 回查 CSV）', all(j.get('link') for j in pool))
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+    print('\n=== 4. 已有 qualified_jobs.json 时绝不覆盖（用户可能已手工收窄） ===')
+    kept = [{'公司': '只投这一家', '职位': 'Java开发', 'link': 'https://x/9'}]
+    run_dir = build_run_dir(
+        params={'keywords': ['Python'], 'cities': ['杭州'], 'match_mode': 'quick'},
+        scored={'tier1': [scored_job('XX科技', 'Java开发', 'https://x/1')],
+                'tier2': [scored_job('YY公司', '全栈', 'https://x/2')]},
+        qualified=kept,
+        materials=[('greeting', 1, '只投这一家'), ('resume', 1, '只投这一家')])
+    try:
+        CODES.clear()
+        code = run([resume, '--run-dir', run_dir, '--to', 'match'])
+        check('退出码 0', code == 0, '实际 %s' % code)
+        pool = json.load(open(paths.qualified_jobs_path(run_dir), encoding='utf-8'))
+        check('文件原样保留', pool == kept, str(pool))
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+    print('\n=== 5. 爬完没有 crawl_summary.json（没登录）：停住，不往下跑 ===')
+    run_dir = build_run_dir(
+        params={'keywords': ['Python'], 'cities': ['杭州'], 'match_mode': 'quick'},
+        crawl_summary=False)
+    try:
+        CODES.clear()
+        code = run([resume, '--run-dir', run_dir, '--from', 'crawl'])
+        check('退出码 1', code == 1, '实际 %s' % code)
+        check('停在 crawl，match 没跑', stages_ran() == ['crawl'], str(stages_ran()))
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+    print('\n=== 6. 岗位池低于最低岗位数：停在 crawl（deep 按岗位烧钱） ===')
+    run_dir = build_run_dir(params={'keywords': ['Python'], 'cities': ['太原'],
+                                    'match_mode': 'deep', 'min_count': 100})
+    try:
+        CODES.clear()
+        code = run([resume, '--run-dir', run_dir, '--from', 'crawl'])
+        check('退出码 1', code == 1, '实际 %s' % code)
+        check('没进 match', stages_ran() == ['crawl'], str(stages_ran()))
+
+        CODES.clear()
+        code = run([resume, '--run-dir', run_dir, '--from', 'crawl', '--to', 'match',
+                    '--min-jobs', '0'])
+        check('--min-jobs 0 是放行开关', 'match' in stages_ran(), str(stages_ran()))
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+    print('\n=== 7. 某阶段失败：立刻停，后面的阶段一个都不跑 ===')
+    run_dir = build_run_dir(params={'keywords': ['Python'], 'cities': ['杭州'],
+                                    'match_mode': 'deep', 'top_n': 5})
+    try:
+        CODES.clear()
+        CODES['deep'] = 1
+        code = run([resume, '--run-dir', run_dir, '--to', 'render'])
+        check('退出码 1', code == 1, '实际 %s' % code)
+        check('停在 deep', stages_ran() == ['parse', 'infer', 'crawl', 'match', 'deep'],
+              str(stages_ran()))
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+    print('\n=== 8. --no-images：不渲染，且提示的投递命令带 --no-image ===')
+    run_dir = build_run_dir(
+        params={'keywords': ['Python'], 'cities': ['杭州'], 'match_mode': 'quick'},
+        scored={'tier1': [scored_job('XX科技', 'Java开发', 'https://x/1')], 'tier2': []},
+        materials=[('greeting', 1, 'XX科技'), ('resume', 1, 'XX科技')])
+    try:
+        CODES.clear()
+        code = run([resume, '--run-dir', run_dir, '--to', 'render', '--no-images', '--verify'])
+        check('退出码 0', code == 0, '实际 %s' % code)
+        check('render 没跑', 'render' not in stages_ran(), str(stages_ran()))
+        # 不要长图 ≠ 不用查材料：招呼语照样会发出去。--verify 显式开才查；
+        # --no-images 把终点压到 verify，正好在核查后停下、不渲染。
+        check('--no-images 配上 --verify 后 verify 仍跑',
+              'verify' in stages_ran(), str(stages_ran()))
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+    print('\n=== 9. materials 部分失败（缺产物）：退出码 3，不当成成功 ===')
+    run_dir = build_run_dir(
+        params={'keywords': ['Python'], 'cities': ['杭州'], 'match_mode': 'quick'},
+        scored={'tier1': [scored_job('XX科技', 'Java开发', 'https://x/1')],
+                'tier2': [scored_job('YY公司', '全栈', 'https://x/2')]},
+        materials=[('greeting', 1, 'XX科技'), ('resume', 1, 'XX科技')])   # #2 的两份都缺
+    try:
+        CODES.clear()
+        code = run([resume, '--run-dir', run_dir, '--to', 'render', '--no-images'])
+        check('退出码 3（部分成功）', code == 3, '实际 %s' % code)
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+    print('\n=== 10. 全程没有任何一条命令指向 apply.py ===')
+    run_dir = build_run_dir(
+        params={'keywords': ['Python'], 'cities': ['杭州'], 'match_mode': 'deep',
+                'top_n': 10},
+        qualified=[{'公司': 'XX科技', '职位': 'Java开发', 'link': 'https://x/1'}],
+        materials=[('greeting', 1, 'XX科技'), ('resume', 1, 'XX科技')])
+    try:
+        CODES.clear()
+        code = run([resume, '--run-dir', run_dir, '--to', 'render'])
+        check('退出码 0', code == 0, '实际 %s' % code)
+        flat = ' '.join(' '.join(cmd) for _, cmd in RAN)
+        check('没有 apply.py', 'apply.py' not in flat, flat)
+        check('没有 auto_apply', 'auto_apply' not in flat, flat)
+        check('没有 --yes 投递开关（-y 是爬虫的确认，不同一回事）',
+              '--yes' not in flat, flat)
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+    # ── 阶段区间语义 ──────────────────────────────────────────────
+    # 「不给 --to 就只跑一个阶段」是这套流水线最容易被悄悄改回去的一条：
+    # 默认值一变，`pipeline.py 简历.pdf` 就会重新把 materials（按岗位两次模型调用）
+    # 顺手跑掉，而退出码仍是 0 —— 没有任何一处会报错。
+    print('\n=== 11. 不给 --to 只跑一个阶段 ===')
+    run_dir = build_run_dir(params={'keywords': ['Python'], 'cities': ['杭州'],
+                                    'match_mode': 'deep', 'top_n': 10})
+    try:
+        CODES.clear()
+        code, out = run_capture([resume, '--run-dir', run_dir])
+        check('退出码 0', code == 0, '实际 %s' % code)
+        check('只跑了 parse', stages_ran() == ['parse'], str(stages_ran()))
+        check('印出下一步命令（--from infer）',
+              '--from infer' in out, out[-400:])
+        check('印出一次跑完余下的命令（--to render）', '--to render' in out, out[-400:])
+
+        CODES.clear()
+        code = run([resume, '--run-dir', run_dir, '--from', 'infer'])
+        check('--from infer 只跑 infer', stages_ran() == ['infer'], str(stages_ran()))
+
+        CODES.clear()
+        code = run([resume, '--run-dir', run_dir, '--from', 'materials'])
+        check('--from materials 不带上 render',
+              stages_ran() == ['materials'], str(stages_ran()))
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+    print('\n=== 12. --from match 是一个整体：match → deep → merge ===')
+    # 深度模式下单跑 match 只写 deep_candidates.json，没有 qualified_jobs.json，
+    # 下游一步都走不了 —— 停在那里是个谁都用不了的半成品。
+    run_dir = build_run_dir(params={'keywords': ['Python'], 'cities': ['杭州'],
+                                    'match_mode': 'deep', 'top_n': 10})
+    try:
+        CODES.clear()
+        code = run([resume, '--run-dir', run_dir, '--from', 'match'])
+        check('退出码 0', code == 0, '实际 %s' % code)
+        check('三步一起跑', stages_ran() == ['match', 'deep', 'merge'], str(stages_ran()))
+        check('materials 没被带上', 'materials' not in stages_ran(), str(stages_ran()))
+
+        CODES.clear()
+        code = run([resume, '--run-dir', run_dir, '--from', 'deep'])
+        check('--from deep 跑到 merge 为止',
+              stages_ran() == ['deep', 'merge'], str(stages_ran()))
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+    print('\n=== 13. 快速模式 --from match：只跑 match，并补出投递池 ===')
+    run_dir = build_run_dir(
+        params={'keywords': ['Python'], 'cities': ['杭州'], 'match_mode': 'quick'},
+        scored={'tier1': [scored_job('XX科技', 'Java开发', 'https://x/1')], 'tier2': []})
+    try:
+        CODES.clear()
+        code, out = run_capture([resume, '--run-dir', run_dir, '--from', 'match'])
+        check('退出码 0', code == 0, '实际 %s' % code)
+        check('deep/merge 没跑（快速模式里它们不存在）',
+              stages_ran() == ['match'], str(stages_ran()))
+        check('qualified_jobs.json 被补出来了',
+              os.path.exists(paths.qualified_jobs_path(run_dir)))
+        # 下一步不能指向 deep/merge —— 快速模式下那条命令只会印「跳过」。
+        check('下一步指向 materials', '--from materials' in out, out[-500:])
+        check('提醒 materials 会按岗位调两次模型', '两次模型' in out, out[-500:])
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+    print('\n=== 14. verify：默认关闭，--verify 才跑；查出编造时停在 render 之前 ===')
+    # verify 默认不跑：整轮 --to render 不自动查材料。只有 --verify（或 --from verify）
+    # 才开。这台闸门开了之后，它「失败」正说明它干了活 —— 要锁两件事：
+    # render 一定不跑（图渲出来人就当材料定稿了），提示得说清是查出了东西。
+    run_dir = build_run_dir(
+        params={'keywords': ['Python'], 'cities': ['杭州'], 'match_mode': 'quick'},
+        scored={'tier1': [scored_job('XX科技', 'Java开发', 'https://x/1')], 'tier2': []},
+        materials=[('greeting', 1, 'XX科技'), ('resume', 1, 'XX科技')])
+    try:
+        # ── 默认关闭：不传 --verify 就不跑；哪怕 verify 本来会退 1，没开也不会拦
+        CODES.clear()
+        CODES['verify'] = 1
+        code, out = run_capture([resume, '--run-dir', run_dir, '--to', 'render'])
+        check('默认关闭：verify 不跑、render 照跑、整轮退 0',
+              code == 0 and 'verify' not in stages_ran() and 'render' in stages_ran(),
+              '%s / %s' % (code, stages_ran()))
+        check('默认关闭时打行提醒：发送前自己逐份看',
+              '默认关闭' in out and '自己逐份看' in out, out[:600])
+
+        # ── --verify 开启后 verify 真跑一次（查不出编造 → 一路走到 render）
+        CODES.clear()
+        code = run([resume, '--run-dir', run_dir, '--to', 'render', '--verify'])
+        check('--verify 开启后 verify 真跑', 'verify' in stages_ran(), str(stages_ran()))
+
+        # ── verify 查出编造 → 停在 render 之前，退出 1
+        # 排查指引（逐条词 + gen_materials.py 重生成 + --allow 放行）由
+        # verify_no_fabrication.py 子进程打在它自己的 stdout 上；这里 run_stage 被
+        # 换成桩、不真起子进程，所以那些文字不在 out 里。pipeline 层只负责两件事：
+        # 1) 把 verify 的退出码 1 原样传出去；2) 不再跑比 verify 更靠后的 render。
+        CODES.clear()
+        CODES['verify'] = 1                     # 查出了简历原文没有的技术词
+        code, out = run_capture([resume, '--run-dir', run_dir, '--to', 'render', '--verify'])
+        check('退出码 1', code == 1, '实际 %s' % code)
+        check('render 没跑（图渲出来就等于材料定稿）',
+              'render' not in stages_ran(), str(stages_ran()))
+        # verify 的退出 1 不是「脚本坏了」：pipeline 不该套上那套通用失败话术
+        check('verify 退出 1 不套用通用「脚本坏了」话术',
+              '脚本坏了' not in out, out[-400:])
+
+        # verify 退 3 = 有几份材料读不动：那是部分成功，不该拦住 render
+        CODES.clear()
+        CODES['verify'] = 3
+        code = run([resume, '--run-dir', run_dir, '--to', 'render', '--verify'])
+        check('verify 退 3 → 整轮 3 且 render 照跑',
+              code == 3 and 'render' in stages_ran(), '%s / %s' % (code, stages_ran()))
+
+        # ── 起点就是 verify（--from verify）也开这台闸门：补查/续查的固有语义
+        CODES.clear()
+        CODES['verify'] = 1
+        code = run([resume, '--run-dir', run_dir, '--from', 'verify'])
+        check('--from verify 也触发 verify（并退 1 拦下来）',
+              code == 1 and 'verify' in stages_ran(), '%s / %s' % (code, stages_ran()))
+
+        # --allow / --only 要透传下去，否则人在 pipeline 上加了参数却不生效
+        CODES.clear()
+        run([resume, '--run-dir', run_dir, '--to', 'render', '--verify', '--allow',
+             'PyTorch,nginx', '--only', '1'])
+        vcmd = cmd_of('verify')
+        check('--allow 透传给 verify', '--allow' in vcmd and 'PyTorch,nginx' in vcmd,
+              pipeline.show(vcmd))
+        check('--only 透传给 verify', '--only' in vcmd and '1' in vcmd,
+              pipeline.show(vcmd))
+        # 不手敲模型参数时，verify 的命令里不该凭空冒出 --model（extra 为空才干净）
+        check('verify 无多余 LLM 参数',
+              '--model' not in vcmd and '--api-key' not in vcmd, pipeline.show(vcmd))
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+        os.remove(resume)
+
+    print('\n=== 15. write_application_md 在 materials 之后自动落盘 ===')
+    run_dir = build_run_dir(
+        params={'keywords': ['Python'], 'cities': ['杭州'], 'match_mode': 'quick'},
+        qualified=[{'公司': 'XX科技', '职位': 'Java开发', 'link': 'https://x/1'}],
+        materials=[('greeting', 1, 'XX科技'), ('resume', 1, 'XX科技')])
+    try:
+        CODES.clear()
+        code = run([resume, '--run-dir', run_dir, '--from', 'materials'])
+        check('退出码 0', code == 0, '实际 %s' % code)
+        names = [n for n, _ in RAN]
+        check('write_application_md 在 materials 之后跑',
+              'write_application_md' in names and 'materials' in names
+              and names.index('write_application_md') > names.index('materials'),
+              str(names))
+        check('write_application_md 用 --all（所有 qualified 岗位都写）',
+              '--all' in cmd_of('write_application_md'),
+              pipeline.show(cmd_of('write_application_md')))
+
+        # --no-images 把终点压到 verify（render 从计划里移除），write_application_md 仍要落盘
+        CODES.clear()
+        code = run([resume, '--run-dir', run_dir, '--from', 'materials', '--to', 'render',
+                    '--no-images'])
+        names = [n for n, _ in RAN]
+        check('--no-images 下 render 不在计划里', 'render' not in names, str(names))
+        check('--no-images 下 write_application_md 照跑',
+              code == 0 and 'write_application_md' in names, '%s / %s' % (code, names))
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+    print('\n=== 16. LLM 阶段存在时先跑 llm_check 预检，配置缺就停 ===')
+    # 计划里含 parse（LLM 阶段）→ 必须先跑 llm_check --no-call；预检失败 → 停，
+    # 一个阶段都不跑。纯 quick 但计划里没有任何 LLM 阶段时不预检（省得白跑）。
+    resume = tempfile.mktemp(suffix='.md')      # 全局 resume 在用例 14 末尾被删了，这里重建
+    with open(resume, 'w', encoding='utf-8') as f:
+        f.write('# 张三\nPython 后端开发，3 年经验。')
+    run_dir = build_run_dir(
+        params={'keywords': ['Python'], 'cities': ['杭州'], 'match_mode': 'quick'},
+        scored={'tier1': [scored_job('XX科技', 'Java开发', 'https://x/1')], 'tier2': []},
+        qualified=[{'公司': 'XX科技', '职位': 'Java开发', 'link': 'https://x/1'}],
+        materials=[('greeting', 1, 'XX科技'), ('resume', 1, 'XX科技')])
+    try:
+        CODES.clear()
+        CODES['llm_check'] = 1                  # 配置缺失
+        code = run([resume, '--run-dir', run_dir, '--to', 'render'])
+        check('预检失败 → 退出码 1', code == 1, '实际 %s' % code)
+        check('配置缺就停在预检，一个阶段都不跑', stages_ran() == [], str(stages_ran()))
+        check('预检用的 --no-call（不花钱）',
+              '--no-call' in cmd_of('llm_check'), pipeline.show(cmd_of('llm_check')))
+
+        CODES.clear()
+        code = run([resume, '--run-dir', run_dir, '--to', 'render'])
+        check('预检通过 → 整轮照常跑', code == 0, '实际 %s' % code)
+        all_names = [n for n, _ in RAN]
+        check('llm_check 在 parse 之前跑',
+              'llm_check' in all_names
+              and all_names.index('llm_check') < all_names.index('parse'),
+              str(all_names))
+
+        # 计划里一个 LLM 阶段都没有（快速模式从 crawl 起）→ 不该预检
+        CODES.clear()
+        run([resume, '--run-dir', run_dir, '--from', 'crawl', '--to', 'crawl'])
+        check('无 LLM 阶段的计划不预检', 'llm_check' not in [n for n, _ in RAN],
+              str([n for n, _ in RAN]))
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+        os.remove(resume)
+
+    print('\n=== 17. render 之后自动跑 verify_image 图检 ===')
+    resume = tempfile.mktemp(suffix='.md')
+    with open(resume, 'w', encoding='utf-8') as f:
+        f.write('# 张三\nPython 后端开发，3 年经验。')
+    run_dir = build_run_dir(
+        params={'keywords': ['Python'], 'cities': ['杭州'], 'match_mode': 'quick'},
+        scored={'tier1': [scored_job('XX科技', 'Java开发', 'https://x/1')], 'tier2': []},
+        materials=[('greeting', 1, 'XX科技'), ('resume', 1, 'XX科技')])
+    try:
+        CODES.clear()
+        code = run([resume, '--run-dir', run_dir, '--to', 'render'])
+        names = [n for n, _ in RAN]
+        check('退出码 0', code == 0, '实际 %s' % code)
+        check('verify_image 在 render 之后跑',
+              'verify_image' in names and 'render' in names
+              and names.index('verify_image') > names.index('render'), str(names))
+        vcmd = cmd_of('verify_image')
+        check('verify_image 指向 deliver 目录并 --all',
+              any('deliver' in c for c in vcmd) and '--all' in vcmd,
+              pipeline.show(vcmd))
+
+        # 图检查出可疑项 → 记成部分成功（退 3），不硬拦
+        CODES.clear()
+        CODES['verify_image'] = 1
+        code = run([resume, '--run-dir', run_dir, '--to', 'render'])
+        check('图检有可疑项 → 退出码 3（部分成功）', code == 3, '实际 %s' % code)
+
+        # --no-images 不渲染 → 没有图可检，verify_image 也不该跑
+        CODES.clear()
+        code = run([resume, '--run-dir', run_dir, '--to', 'render', '--no-images'])
+        check('--no-images 下 verify_image 不跑', 'verify_image' not in [n for n, _ in RAN],
+              str([n for n, _ in RAN]))
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+        os.remove(resume)
+
+    print('\n' + '=' * 60)
+    if failures:
+        print('❌ %d 条断言失败：' % len(failures))
+        for item in failures:
+            print('  - %s' % item)
+        return 1
+    print('✅ 流水线编排测试全部通过')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

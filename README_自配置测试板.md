@@ -1,0 +1,181 @@
+# BOSS 自配置采集与投递测试板
+
+这是一个可换岗位、换城市、换筛选条件的本地工具。日常只需要修改 `custom_profile.json`，不需要改 Python 代码。
+
+## 先看运行入口
+
+| 你要做什么 | 双击哪个文件 | 结果 |
+| --- | --- | --- |
+| 第一次安装和登录 | `安装依赖并登录.bat` | 安装依赖并打开 BOSS 登录检查；登录状态保存在本工程内 |
+| 只采集 10 条，不投递 | `自定义配置_只采集10条.cmd` | 用当前配置采集 10 条，用于检查筛选规则 |
+| 换岗位、换配置后正式重新开始 | `自定义岗位_重新采集并投递.cmd` | 清理当前配置对应的旧 CSV，重新采集并创建新的投递任务 |
+| 中断后继续、第二天继续 | `启动自定义岗位.cmd` | 恢复同一配置最近一个未完成任务，从保存的位置继续；不触发新的采集 |
+
+> `启动自定义岗位.cmd` 用于续投，**不会**强制重新采集。想丢弃当前采集结果并按新配置重新开始时，才用 `自定义岗位_重新采集并投递.cmd`。
+
+## 第一次使用：按顺序做
+
+1. 双击 `安装依赖并登录.bat`。
+2. 在程序打开的 BOSS 浏览器里完成登录，然后回到终端窗口按回车复检。程序确认后会正常保存登录状态。
+3. 用记事本打开 `custom_profile.json`。
+4. 按自己的目标修改配置，保存。
+5. 双击 `自定义配置_只采集10条.cmd`，先检查采集样本。
+6. 样本符合要求后，双击 `自定义岗位_重新采集并投递.cmd`。
+
+## 日常使用流程
+
+### 1. 只测试筛选，不投递
+
+双击：`自定义配置_只采集10条.cmd`
+
+采集结果在：
+
+```text
+assets\post_data\<collection_id>\
+```
+
+默认 `collection_id` 是 `my-role-v1`，所以 CSV 会在：
+
+```text
+assets\post_data\my-role-v1\
+```
+
+打开 CSV，重点检查职位、城市、公司、薪资是否符合预期。样本不对时，只改配置后再次运行此测试采集入口。
+
+### 2. 正式重新采集并投递
+
+双击：`自定义岗位_重新采集并投递.cmd`
+
+它会只清除当前 `collection_id` 对应的旧采集 CSV，然后重新采集、过滤和投递。不会删除其他岗位配置的数据。
+
+### 3. 中断或第二天继续
+
+双击：`启动自定义岗位.cmd`
+
+程序会优先读取：
+
+```text
+assets\embedded_runs\<最近未完成任务>\state\apply_checkpoint.json
+```
+
+从 `next_index` 指向的下一个岗位继续，不重新从第一个岗位开始，也不重新清空或补采 CSV。没有未完成任务时，它只使用现有 CSV，不会自行开始新采集。
+
+当 BOSS 页面实际出现 120 次沟通提醒或 150 次当日上限提示时，程序会停止等待人工处理；次日再运行“启动自定义岗位”即可尝试继续。
+
+## `custom_profile.json` 怎么改
+
+这是日常唯一需要修改的文件。
+
+### 身份与数据隔离
+
+```json
+"collection_id": "my-role-v1",
+"profile_id": "my-role-v1",
+"profile_name": "岗位名称（改这里）"
+```
+
+- `collection_id`：决定采集 CSV 存放在哪个子目录。
+- `profile_id`：决定续投时匹配哪一类任务。
+- 换成完全不同的岗位时，建议两个值改成相同的新名字，例如 `hardware-fae-2026`，避免和旧岗位数据混在一起。
+
+### 搜索词和城市
+
+```json
+"search_queries": ["单片机，嵌入式，机器人，具身智能，FAE，硬件"],
+"test_cities": ["上海"],
+"production_cities": ["上海", "苏州", "南京", "杭州", "宁波"]
+```
+
+- `search_queries` 当前是一整个搜索框里输入的一整串词。保持一个字符串即可。
+- `test_cities`：10 条测试采集使用的城市。
+- `production_cities`：正式采集使用的城市，按数组顺序逐个切换。
+- 每次城市切换都会重新带入完整关键词串。
+- 即使 BOSS 搜索后页面默认回到上海，程序也会用列表 API 返回的实际城市做校验；实际城市与当前城市不一致的岗位不会写入 CSV。
+
+### 研发准入和硬屏蔽
+
+```json
+"research_gate_keywords": ["嵌入式", "单片机", "mcu", "硬件", "pcb", "fae", "机器人"],
+"hard_blocked_title_keywords": ["教师", "销售", "运营", "公关", "普工"],
+"match_keywords": ["单片机", "嵌入式", "机器人", "具身智能", "fae", "硬件"]
+```
+
+- `research_gate_keywords`：职位名或技能标签至少命中一个，才算研发方向。
+- `hard_blocked_title_keywords`：只检查职位标题。命中教师、销售、运营、公关、职能、生产服务等词时，直接排除；即使标题里同时有“机器人”或“嵌入式”也不会放行。
+- `match_keywords`：岗位标题、技能、岗位描述等完整文本至少命中一个目标词。
+- `exclude_keywords`：完整文本命中就排除，适合“焊接”“数据采集”等不希望出现的内容。
+- `blocked_title_keywords`：普通标题屏蔽词；`hard_blocked_title_keywords` 用于绝不能放行的非研发岗位。
+
+默认规则会拦截：机器人教师、嵌入式销售、具身智能数据运营、品牌公关 PR、游戏测试员等；会保留嵌入式软件工程师、FAE 现场应用工程师、硬件测试工程师等。
+
+### 薪资与数量
+
+```json
+"salary_min_k": 8,
+"salary_max_k": 12,
+"salary_match_mode": "inside",
+"internship_daily_salary_min_yuan": 200,
+"test_collect_total": 10,
+"production_crawl_count_per_query_city": 0,
+"production_candidate_limit": 0
+```
+
+- `salary_min_k` / `salary_max_k`：月薪范围。填写 `null` 表示不限制该一侧。
+- `salary_match_mode`：`inside` 要求整个薪资区间落在范围内；`overlap` 只要有交集即可。
+- `internship_daily_salary_min_yuan: 200`：日薪起薪不高于 200 元的岗位跳过。
+- `test_collect_total: 10`：测试采集最多保留 10 条。
+- `production_crawl_count_per_query_city: 0`：正式采集时，每个“关键词 × 城市”不设写入条数上限。
+- `production_candidate_limit: 0`：正式候选不设程序内总数量上限。
+
+### 运行节奏和招呼语
+
+```json
+"min_interval_seconds": 10,
+"max_interval_seconds": 15,
+"greeting": "您好，我想应聘这个岗位，方便的话请您查看我的简历，谢谢。"
+```
+
+- 间隔范围用于正常采集/沟通之间的等待。
+- 招呼语必须与自己的真实经历一致。
+
+## 核心文件和文件夹
+
+| 路径 | 用途 | 日常是否修改 |
+| --- | --- | --- |
+| `custom_profile.json` | 当前正在使用的自定义岗位配置 | 是 |
+| `custom_profile_template.json` | 新建配置的模板 | 可按需修改 |
+| `embedded_auto.py` | 总控：采集、规则筛选、候选计划、续投 | 否 |
+| `scripts\boss_crawler\` | BOSS 列表采集、城市校验、CSV 写入 | 否 |
+| `scripts\resume_matcher\auto_apply.py` | 打开岗位、检查已沟通、执行沟通与保存检查点 | 否 |
+| `assets\chrome_user_data\` | 这个工程自己的浏览器登录状态 | 否，不要手动删除 |
+| `assets\post_data\<collection_id>\` | 本配置采集到的 CSV 样本 | 可查看；重采集入口会自动清理当前配置对应目录 |
+| `assets\embedded_runs\` | 候选计划、投递日志、续投检查点 | 不要手动修改 |
+| `assets\embedded_applied.jsonl` | 已成功沟通岗位账本，用于避免重复投递 | 不要手动修改 |
+
+## 常见情况
+
+### 想改成另一个行业或岗位
+
+1. 修改 `collection_id` 和 `profile_id` 为新名字。
+2. 修改 `search_queries`、`match_keywords`、`research_gate_keywords`、屏蔽词、城市和薪资。
+3. 先运行 `自定义配置_只采集10条.cmd`。
+4. 样本合格后运行 `自定义岗位_重新采集并投递.cmd`。
+
+### 想重做同一岗位的采集
+
+直接双击 `自定义岗位_重新采集并投递.cmd`。不要用“启动自定义岗位”，后者只负责继续未完成任务。
+
+### CSV 里没有当前城市的数据
+
+先确认配置中该城市名称正确。若 BOSS 搜索页自己回到上海，日志会显示“实际返回其他城市岗位”，这些数据会被自动跳过；这说明城市保护生效，不是混采。
+
+### BOSS 已经沟通过的岗位
+
+投递前会检查页面上的“继续沟通”、已有招呼语或聊天记录；发现已沟通会跳过，不重复发送。
+
+## 不建议做的事
+
+- 不要直接编辑 `assets\embedded_runs` 下的 JSON 检查点。
+- 不要删除 `assets\chrome_user_data`，否则需要重新登录。
+- 不要手动混合不同 `collection_id` 目录下的 CSV。
+- 不要在还需要续投时运行“重新采集并投递”，否则会创建新的任务。
